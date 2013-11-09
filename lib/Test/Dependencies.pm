@@ -17,6 +17,8 @@ use Perl::PrereqScanner;
 use Carp qw(croak);
 use Cwd;
 
+use Data::Dumper;
+
 use version 0.77;
 
 require Exporter;
@@ -31,6 +33,8 @@ sub all_dependencies_ok {
 	my (%opt) = @_;
 
 	my $corelist;
+
+	# Explicitly ignored files
 	my %ignore;
 
 	if ($corelist = delete $opt{corelist}) {
@@ -61,12 +65,29 @@ sub all_dependencies_ok {
 	}
 
 	my $meta = get_meta(getcwd) or die "Failed to find our meta modules\n";
+	my $prereqs = $meta->effective_prereqs;
 
-	my %listed = map { $_ => 1 }
-		$meta->effective_prereqs->merged_requirements->required_modules;
+	my %listed;
+
+	# Track requirements listed for different phases
+	for my $phase (qw(configure build test runtime)) {
+		my $reqs = $prereqs->requirements_for($phase, 'requires');
+
+		$listed{$phase}{$_} = 1 for $reqs->required_modules;
+		$listed{all}{$_} = 1 for $reqs->required_modules;
+	}
+
+	# Accumulate configure into build
+	$listed{build}{$_} = 1 for keys %{ $listed{configure} };
+
+	# There isn't really a test_requires (it's in build)
+	$listed{build}{$_} = 1 for keys %{ $listed{test} };
 
 	# Find all of our files
 	my @files = all_pod_files('.');
+
+	# list of our files
+	my %our;
 
 	# First, assemble list of our packages to ignore them
 	for my $f (@files) {
@@ -78,7 +99,7 @@ sub all_dependencies_ok {
 		# Get the name of the main package
 		my $pkg = eval { $document->find_first('PPI::Statement::Package')->namespace; };
 		if ($pkg) {
-			$ignore{$pkg} = 1;
+			$our{$pkg} = 1;
 		}
 	}
 
@@ -95,23 +116,49 @@ sub all_dependencies_ok {
 		my $prereqs = $scanner->scan_file($f);
 
 		for my $req ($prereqs->required_modules) {
-			next if $done{$req}++;
+			my $ok;
+			my $why = '';
 
-			my $ok = $listed{$req} || $ignore{$req};
+			if ($ignore{$req}) {
+				$ok = 1;
+				$why = ' [ignored]';
 
-			my $cl = '';
+			} elsif ($our{$req}) {
+				$ok = 1;
+				$why = ' [internal dependency]';
+
+			} else {
+				my $phase = determine_phase($f);
+
+				if ($phase) {
+					next if $done{$phase}{$req}++;
+
+					# set this on success/error if detected phase
+					$why = " [listed in correct phase ${phase}_requires]";
+
+					if ($listed{$phase}{$req}) {
+						$ok = 1;
+					}
+				} elsif ($listed{all}{$req}) {
+					$ok = 1;
+					$why = " [listed as a requirement (could not determine phase)]";
+				}
+			}
 
 			# Hmm not found, should we ignore core modules?
 			if (!$ok && $corelist) {
+				next if $done{corelist}{$req}++;
+
 				my $fr = Module::CoreList->first_release($req);
 
 				if ($fr && version->parse($fr) <= $corelist) {
 					$ok = 1;
-					$cl = " [corelist]";
+					$why = ' [corelist]';
 				}
 			}
 
-			ok($ok, "[$f] Module '$req' is listed in prereqs$cl");
+
+			ok($ok, "[$f] Module '$req' is listed in prereqs$why");
 		}
 	}		
 
@@ -145,6 +192,31 @@ sub get_meta {
 	}
 
 	die "Failed to parse MYMETA files: " . Dumper(\%errors);
+}
+
+# Try to guess which phase a file is in. (configure runtime build test)
+# Fail? return nothing. This could be better
+sub determine_phase {
+	my ($f) = @_;
+
+	my $phase;
+
+	if ($f =~ /\.t/) {
+		$phase = 'build';
+
+	} elsif ($f =~ /\.p(m|l)/ && $f !~ m#(\.t/|/t/)#) {
+		$phase = 'runtime';
+
+	} elsif ($f =~ m#(\.bin/|/bin/)#) {
+		$phase = 'runtime';
+
+	} elsif ($f =~ /(Build\.PL|Makefile\.PL)/) {
+		$phase = 'configure';
+	}
+
+	# Others???
+
+	return $phase;
 }
 
 1;

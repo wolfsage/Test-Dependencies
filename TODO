@@ -1,0 +1,3 @@
+ * Decide how corelist => '...' functionality should actually behave
+
+ * all_pod_files doesn't find bin/*
