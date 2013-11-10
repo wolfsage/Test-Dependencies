@@ -10,6 +10,7 @@ use Test::Pod; # all_pod_files
 
 use CPAN::Meta;
 use Module::CoreList;
+use Module::Path qw(module_path);
 
 use PPI;
 use Perl::PrereqScanner;
@@ -74,7 +75,44 @@ sub all_dependencies_ok {
 		my $reqs = $prereqs->requirements_for($phase, 'requires');
 
 		$listed{$phase}{$_} = 1 for $reqs->required_modules;
-		$listed{all}{$_} = 1 for $reqs->required_modules;
+	}
+
+	my $scanner = Perl::PrereqScanner->new();
+
+	# Now for each listed, find its provides that match its name, and
+	# fill those in
+	for my $phase (keys %listed) {
+		for my $pkg (keys %{ $listed{$phase} }) {
+			my @work = $pkg;
+
+			my %done;
+
+			while (@work) {
+				my $next = shift @work;
+				next if $done{$next}++;
+				next if $next eq 'perl'; # Heh.
+
+				my $path = module_path($next);
+				if (!$path) {
+					if ($next !~ /::XS/) {
+						warn "Module $next not found?! Skipping...\n";
+					}
+					next;
+				}
+
+				my $prereqs = $scanner->scan_file($path);
+
+				for my $m ($prereqs->required_modules) {
+					# Only pay attention to ones that
+					# look like us for now
+					next if $m !~ /^$next/;
+
+					$listed{$phase}{$m} = 1;
+
+					push @work, $m;
+				}
+			}
+		}
 	}
 
 	# Accumulate configure into build
@@ -82,6 +120,11 @@ sub all_dependencies_ok {
 
 	# There isn't really a test_requires (it's in build)
 	$listed{build}{$_} = 1 for keys %{ $listed{test} };
+
+	# Track all of them
+	for my $phase (keys %listed) {
+		$listed{all}{$_} = 1 for keys %{ $listed{$phase} };
+	}
 
 	# Find all of our files
 	my @files = all_pod_files('.');
@@ -104,8 +147,6 @@ sub all_dependencies_ok {
 	}
 
 	# Scan them!
-	my $scanner = Perl::PrereqScanner->new();
-
 	my %done;
 
 	for my $f (@files) {
